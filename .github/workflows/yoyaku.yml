@@ -13,10 +13,10 @@ on:
         description: "予約テスト(入力まで。送信はしない)"
         type: boolean
         default: false
-      reset_booked:
-        description: "予約済みを解除して再開する"
-        type: boolean
-        default: false
+      unbook_day:
+        description: "キャンセルした日をまた狙う(例: 11/12 、全部なら all)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -45,12 +45,12 @@ jobs:
           BOOK_EMAIL: ${{ secrets.BOOK_EMAIL }}
           TEST_LINE: ${{ github.event.inputs.test_line }}
           TEST_BOOKING: ${{ github.event.inputs.test_booking }}
-          RESET_BOOKED: ${{ github.event.inputs.reset_booked }}
+          UNBOOK_DAY: ${{ github.event.inputs.unbook_day }}
         run: |
           cat > check.py <<'PYEOF'
           """ALiS永楽 自動予約チェッカー
           ヘアセット 洋装 / りりさん / 平日 19:30〜19:45 スタートの枠が空いたら自動で予約し、LINE で知らせる。
-          1件予約できたら止まる(お店のルールで同じ日に2枠は不可、キープ扱いを避けるため)。
+          1日1枠まで(お店のルールで同じ日に2枠は不可)。別の日は何件でも取る。
           """
           import datetime as dt
           import json
@@ -216,13 +216,23 @@ jobs:
           # ---------- メイン ----------
           def main():
               now = dt.datetime.now(JST)
+              today = now.date().isoformat()
               state = json.loads(STATE.read_text()) if STATE.exists() else {}
               state.setdefault("notified", [])
+              booked = state.setdefault("booked_days", {})   # {"2026-11-12": "11/12(水) 19:30"}
               log = [f"## チェック結果 {now:%m/%d %H:%M}"]
 
-              if os.getenv("RESET_BOOKED") == "true" and state.get("booked"):
-                  log.append(f"予約済みの記録({state['booked']})を消して再開")
-                  state.pop("booked")
+              # 「予約済みを解除する日」(例: 11/12 、全部なら all)
+              unbook = (os.getenv("UNBOOK_DAY") or "").strip()
+              if unbook:
+                  for day in list(booked):
+                      d = dt.date.fromisoformat(day)
+                      if unbook.lower() == "all" or unbook in (f"{d.month}/{d.day}", f"{d.month:02d}/{d.day:02d}"):
+                          log.append(f"{booked.pop(day)} の予約済み記録を消した(その日もまた狙う)")
+
+              # 過ぎた日の記録は消す
+              for day in [d for d in booked if d < today]:
+                  booked.pop(day)
 
               if os.getenv("TEST_LINE") == "true":
                   send_line("✅ テスト通知：空き枠チェッカーとLINEがつながったで")
@@ -231,6 +241,8 @@ jobs:
               hits = [t for t in slots if wanted(t)]
               log.append(f"りりさんの空き枠(全時間帯): {len(slots)} 件 / 条件に合う枠: {len(hits)} 件")
               log += [f"- {label(t)}" for t in hits]
+              if booked:
+                  log.append("予約済みの日: " + "、".join(booked[d] for d in sorted(booked)))
 
               # 予約テスト:一番先の枠で入力まで試す(送信はしない)
               if os.getenv("TEST_BOOKING") == "true" and slots:
@@ -239,25 +251,24 @@ jobs:
                   log.append(f"予約テスト {label(t)}: {msg}")
                   send_line(f"🧪 予約テスト({label(t)}):{msg}")
 
-              if state.get("booked"):
-                  log.append(f"予約済み({state['booked']})なので今回は何もせえへん")
-              else:
-                  done = set(state["notified"])
-                  new = [t for t in hits if t.isoformat() not in done]
-                  for t in new:
-                      done.add(t.isoformat())
-                      if AUTO_BOOK:
-                          result, msg = book(t)
-                          log.append(f"{label(t)} の予約: {msg}")
-                          if result == "ok":
-                              state["booked"] = label(t)
-                              send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n"
-                                        f"行かれへん時は早めにキャンセルしてな。\n次を取りたい時は GitHub で『予約済みを解除』して実行してな。")
-                              break
-                          send_line(f"⚠️ りりさんに空き({label(t)})が出たけど自動予約できへんかった。\n理由:{msg}\n\n急いで手動で👇\n{BOOK_URL}")
+              done = set(state["notified"])
+              for t in hits:
+                  day = t.date().isoformat()
+                  if day in booked or t.isoformat() in done:
+                      continue
+                  done.add(t.isoformat())
+                  if AUTO_BOOK:
+                      result, msg = book(t)
+                      log.append(f"{label(t)} の予約: {msg}")
+                      if result == "ok":
+                          booked[day] = label(t)
+                          send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n行かれへん時は早めにキャンセルしてな。")
                       else:
-                          send_line(f"🔔 りりさんに空きが出たで！\nALiS永楽 ヘアセット(洋装)\n・{label(t)}\n\n早めに予約してな👇\n{BOOK_URL}")
-                  state["notified"] = sorted(done & {t.isoformat() for t in hits})
+                          send_line(f"⚠️ りりさんに空き({label(t)})が出たけど自動予約できへんかった。\n理由:{msg}\n\n急いで手動で👇\n{BOOK_URL}")
+                  else:
+                      send_line(f"🔔 りりさんに空きが出たで！\nALiS永楽 ヘアセット(洋装)\n・{label(t)}\n\n早めに予約してな👇\n{BOOK_URL}")
+              state["notified"] = sorted(done & {t.isoformat() for t in hits})
+              state.pop("booked", None)
 
               STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1))
               text = "\n".join(log)
