@@ -3,6 +3,8 @@ name: 空き枠チェック
 on:
   schedule:
     - cron: "*/5 * * * *"   # 5分おき(GitHubの都合で数分〜十数分遅れることがある)
+    - cron: "20 9 * * 1-5"  # 平日18:20(日本時間) 張り付きモード開始
+    - cron: "50 9 * * 1-5"  # 平日18:50(日本時間) 張り付きモードの予備
   workflow_dispatch:
     inputs:
       test_line:
@@ -28,7 +30,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
 
@@ -121,79 +123,167 @@ jobs:
 
 
           # ---------- 予約する ----------
-          def book(t, submit=True):
-              """画面を操作して予約する。結果を ("ok"|"held"|"fail", 説明) で返す。"""
-              from playwright.sync_api import sync_playwright
+          SEL_JS = "() => [...document.querySelectorAll('[data-testid^=date-]')].map(e=>e.dataset.testid).filter(x=>x.endsWith('-selected'))"
+          TIMES_JS = "() => [...document.querySelectorAll('[data-testid=time-slot]')].map(e=>e.innerText.trim())"
 
+
+          def booking_info():
               info = {k: os.getenv(k, "").strip() for k in ("BOOK_LAST", "BOOK_FIRST", "BOOK_PHONE", "BOOK_EMAIL")}
               if not all(info.values()):
-                  return "fail", "予約用の Secrets(BOOK_LAST / BOOK_FIRST / BOOK_PHONE / BOOK_EMAIL)が足りへん"
+                  return None
               phone = info["BOOK_PHONE"].replace("-", "").replace(" ", "")
               if phone.startswith("+81"):
                   phone = phone[3:]
-              phone = phone.lstrip("0")
+              info["BOOK_PHONE"] = phone.lstrip("0")
+              return info
 
-              sel_js = "() => [...document.querySelectorAll('[data-testid^=date-]')].map(e=>e.dataset.testid).filter(x=>x.endsWith('-selected'))"
-              want_sel = [f"date-{t.day}-selected"]
 
+          def prepare(pg):
+              """メニューとりりさんを選んだ状態(「予約」ボタンを押す直前)まで進める。"""
+              pg.goto(BOOK_URL, wait_until="load", timeout=60000)
+              pg.locator("label", has_text="洋装").first.click()
+              pg.locator("label", has_text="りり").first.click()
+              pg.wait_for_timeout(500)
+
+
+          def go_calendar(pg, day):
+              """「予約」を押してカレンダーを出し、day(日付)を選ぶ。押した時点の最新の空き枠が読み込まれる。"""
+              pg.get_by_text("予約", exact=True).last.click()
+              pg.get_by_test_id("time-slot").first.wait_for(timeout=30000)
+              want = [f"date-{day.day}-selected"]
+              for _ in range(8):
+                  if pg.evaluate(SEL_JS) == want:
+                      return True
+                  btn = pg.get_by_test_id(f"date-{day.day}")
+                  if btn.count():
+                      btn.click(timeout=3000)
+                      try:
+                          pg.wait_for_function(f"() => !!document.querySelector('[data-testid=\"date-{day.day}-selected\"]')", timeout=2500)
+                          pg.wait_for_timeout(300)
+                          return True
+                      except Exception:
+                          pass
+                  pg.get_by_test_id("next-week-button").click()
+                  pg.wait_for_timeout(700)
+              return pg.evaluate(SEL_JS) == want
+
+
+          def open_calendar(pg, day):
+              prepare(pg)
+              return go_calendar(pg, day)
+
+
+          def checkout(pg, t, info, submit=True):
+              """時間を押して、名前などを入れて予約する。"""
+              slot = pg.get_by_test_id("time-slot").filter(has_text=f"{t:%H:%M}")
+              if not slot.count():
+                  return "fail", "画面に行ったら枠がもう無かった(先に取られたかも)"
+              slot.first.click()
+              pg.wait_for_url("**/checkout", timeout=30000)
+              pg.locator("market-field[name=phone] input").first.fill(info["BOOK_PHONE"])
+              pg.locator("market-field[name=lastName] input").first.fill(info["BOOK_LAST"])
+              pg.locator("market-field[name=firstName] input").first.fill(info["BOOK_FIRST"])
+              pg.locator("market-field[name=email] input").first.fill(info["BOOK_EMAIL"])
+              pg.wait_for_timeout(500)
+              if not submit:
+                  return "held", "入力まで成功(テストやから送信はしてへん。枠は10分で自動解除)"
+              btn = pg.get_by_test_id("book-appointment-button-mobile")
+              if not btn.is_visible():
+                  btn = pg.get_by_test_id("book-appointment-button-desktop")
+              btn.click()
+              pg.wait_for_timeout(8000)
+              body = pg.inner_text("body")
+              if "checkout" not in pg.url or any(w in body for w in ("確定", "完了", "ありがとう", "予約済み")):
+                  return "ok", "予約できた"
+              if any(w in body for w in ("コード", "認証", "確認番号")):
+                  return "fail", "確認コードの入力を求められて止まった。10分以内やったら予約ページから手動で続けてな"
+              return "fail", "送信後に完了画面が出えへんかった。念のためメールを確認して"
+
+
+          def new_page(p):
+              browser = p.chromium.launch(channel="chrome")
+              pg = browser.new_page(locale="ja-JP", timezone_id="Asia/Tokyo", viewport={"width": 390, "height": 844})
+              pg.set_default_timeout(20000)
+              return browser, pg
+
+
+          def book(t, submit=True):
+              """普段用:見つけた空き枠を予約する。結果を ("ok"|"held"|"fail", 説明) で返す。"""
+              from playwright.sync_api import sync_playwright
+              info = booking_info()
+              if not info:
+                  return "fail", "予約用の Secrets(BOOK_LAST / BOOK_FIRST / BOOK_PHONE / BOOK_EMAIL)が足りへん"
               with sync_playwright() as p:
-                  browser = p.chromium.launch(channel="chrome")
-                  pg = browser.new_page(locale="ja-JP", timezone_id="Asia/Tokyo", viewport={"width": 390, "height": 844})
-                  pg.set_default_timeout(20000)
+                  browser, pg = new_page(p)
                   try:
-                      pg.goto(BOOK_URL, wait_until="load", timeout=60000)
-                      pg.locator("label", has_text="洋装").first.click()
-                      pg.wait_for_timeout(600)
-                      pg.locator("label", has_text="りり").first.click()
-                      pg.wait_for_timeout(800)
-                      pg.get_by_text("予約", exact=True).last.click()
-                      pg.get_by_test_id("time-slot").first.wait_for(timeout=30000)
-
-                      # 日付を選ぶ(見えてなければ「来週」へ進む)
-                      for _ in range(6):
-                          if pg.evaluate(sel_js) == want_sel:
-                              break
-                          day_btn = pg.get_by_test_id(f"date-{t.day}")
-                          if day_btn.count():
-                              day_btn.click(timeout=3000)
-                              pg.wait_for_timeout(2000)
-                              if pg.evaluate(sel_js) == want_sel:
-                                  break
-                          pg.get_by_test_id("next-week-button").click()
-                          pg.wait_for_timeout(2000)
-                      if pg.evaluate(sel_js) != want_sel:
+                      if not open_calendar(pg, t.date()):
                           return "fail", "カレンダーで日付を選べへんかった"
-
-                      slot = pg.get_by_test_id("time-slot").filter(has_text=f"{t:%H:%M}")
-                      if not slot.count():
-                          return "fail", "画面に行ったら枠がもう無かった(先に取られたかも)"
-                      slot.first.click()
-                      pg.wait_for_url("**/checkout", timeout=30000)
-
-                      pg.locator("market-field[name=phone] input").first.fill(phone)
-                      pg.locator("market-field[name=lastName] input").first.fill(info["BOOK_LAST"])
-                      pg.locator("market-field[name=firstName] input").first.fill(info["BOOK_FIRST"])
-                      pg.locator("market-field[name=email] input").first.fill(info["BOOK_EMAIL"])
-                      pg.wait_for_timeout(800)
-
-                      if not submit:
-                          return "held", "入力まで成功(テストやから送信はしてへん。枠は10分で自動解除)"
-
-                      btn = pg.get_by_test_id("book-appointment-button-mobile")
-                      if not btn.is_visible():
-                          btn = pg.get_by_test_id("book-appointment-button-desktop")
-                      btn.click()
-                      pg.wait_for_timeout(8000)
-
-                      body = pg.inner_text("body")
-                      url = pg.url
-                      if "checkout" not in url or any(w in body for w in ("確定", "完了", "ありがとう", "予約済み")):
-                          return "ok", "予約できた"
-                      if any(w in body for w in ("コード", "認証", "確認番号")):
-                          return "fail", "確認コードの入力を求められて止まった。10分以内やったら予約ページから手動で続けてな"
-                      return "fail", "送信後に完了画面が出えへんかった。念のためSMSやメールを確認して"
+                      return checkout(pg, t, info, submit)
                   except Exception as e:
                       return "fail", f"画面操作の途中でエラー: {type(e).__name__}"
+                  finally:
+                      browser.close()
+
+
+          def snipe(now, booked, log):
+              """張り付きモード:2週間後の同じ日の19:30/19:45 は、今日の19:30/19:45 ぴったりに開く。
+              開く少し前から画面を開いて待ち構えて、出た瞬間に予約する。"""
+              import time
+              from playwright.sync_api import sync_playwright
+
+              day = now.date() + dt.timedelta(days=DAYS_AHEAD)
+              targets = []
+              h, m = EARLIEST
+              while (h, m) <= LATEST:
+                  t = dt.datetime(day.year, day.month, day.day, h, m, tzinfo=JST)
+                  if wanted(t) and t - dt.timedelta(days=DAYS_AHEAD) + dt.timedelta(minutes=10) > now:
+                      targets.append(t)
+                  m += 15
+                  h, m = h + m // 60, m % 60
+              if not targets or day.isoformat() in booked:
+                  return
+              info = booking_info()
+              if not info:
+                  log.append("張り付きモード:予約用の Secrets が足りへんから中止")
+                  return
+
+              log.append("張り付きモード:" + "、".join(label(t) for t in targets) + " を狙う")
+              with sync_playwright() as p:
+                  browser, pg = new_page(p)
+                  try:
+                      for t in targets:
+                          open_at = t - dt.timedelta(days=DAYS_AHEAD)      # この時刻に枠が開く
+                          give_up = open_at + dt.timedelta(minutes=10)
+                          # 開く1分前まで待って、メニューとりりさんを選んだ状態で待ち構える
+                          wait = (open_at - dt.timedelta(seconds=60) - dt.datetime.now(JST)).total_seconds()
+                          if wait > 0:
+                              time.sleep(wait)
+                          prepare(pg)
+                          ready = True
+                          while dt.datetime.now(JST) < give_up:
+                              if not ready:
+                                  prepare(pg)
+                                  ready = True
+                              try:
+                                  found = t in fetch_slots(dt.datetime.now(JST))
+                              except Exception:
+                                  found = False
+                              if not found:
+                                  time.sleep(1)
+                                  continue
+                              ready = False
+                              if not go_calendar(pg, day):
+                                  log.append("張り付きモード:カレンダーで日付を選べへんかった")
+                                  continue
+                              result, msg = checkout(pg, t, info)
+                              log.append(f"張り付きモード {label(t)}: {msg}")
+                              if result == "ok":
+                                  booked[day.isoformat()] = label(t)
+                                  send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n行かれへん時は早めにキャンセルしてな。")
+                                  return
+                          log.append(f"張り付きモード {label(t)}: 取れへんかった")
+                  except Exception as e:
+                      log.append(f"張り付きモード:エラー {type(e).__name__}")
                   finally:
                       browser.close()
 
@@ -250,6 +340,13 @@ jobs:
                   result, msg = book(t, submit=False)
                   log.append(f"予約テスト {label(t)}: {msg}")
                   send_line(f"🧪 予約テスト({label(t)}):{msg}")
+
+              # 張り付きモード:平日の 18:20〜19:46 の間に動いた時だけ
+              if AUTO_BOOK and (dt.time(18, 20) <= now.time() <= dt.time(LATEST[0], LATEST[1] + 1)):
+                  snipe(now, booked, log)
+                  now = dt.datetime.now(JST)
+                  slots = fetch_slots(now)
+                  hits = [t for t in slots if wanted(t)]
 
               done = set(state["notified"])
               for t in hits:
