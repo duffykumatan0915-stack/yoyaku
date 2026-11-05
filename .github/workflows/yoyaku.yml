@@ -1,0 +1,282 @@
+name: 空き枠チェック
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5分おき(GitHubの都合で数分〜十数分遅れることがある)
+  workflow_dispatch:
+    inputs:
+      test_line:
+        description: "LINEにテスト通知を送る"
+        type: boolean
+        default: false
+      test_booking:
+        description: "予約テスト(入力まで。送信はしない)"
+        type: boolean
+        default: false
+      reset_booked:
+        description: "予約済みを解除して再開する"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 準備
+        run: pip install --quiet playwright
+
+      - name: 空き枠をチェック
+        env:
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          BOOK_LAST: ${{ secrets.BOOK_LAST }}
+          BOOK_FIRST: ${{ secrets.BOOK_FIRST }}
+          BOOK_PHONE: ${{ secrets.BOOK_PHONE }}
+          BOOK_EMAIL: ${{ secrets.BOOK_EMAIL }}
+          TEST_LINE: ${{ github.event.inputs.test_line }}
+          TEST_BOOKING: ${{ github.event.inputs.test_booking }}
+          RESET_BOOKED: ${{ github.event.inputs.reset_booked }}
+        run: |
+          cat > check.py <<'PYEOF'
+          """ALiS永楽 自動予約チェッカー
+          ヘアセット 洋装 / りりさん / 平日 19:30〜19:45 スタートの枠が空いたら自動で予約し、LINE で知らせる。
+          1件予約できたら止まる(お店のルールで同じ日に2枠は不可、キープ扱いを避けるため)。
+          """
+          import datetime as dt
+          import json
+          import os
+          import pathlib
+          import urllib.request
+          from zoneinfo import ZoneInfo
+
+          # ===== 設定(ここを変えれば条件を変えられる) =====
+          EARLIEST = (19, 30)        # この時刻以降に始まる枠
+          LATEST = (19, 45)          # この時刻までに始まる枠
+          WEEKDAYS_ONLY = True       # 平日(月〜金)だけ
+          DAYS_AHEAD = 14            # 何日先まで見るか(お店の受付は2週間先まで)
+          AUTO_BOOK = True           # False にすると通知だけ
+          # =================================================
+
+          BOOK_URL = "https://book.squareup.com/appointments/jjrlxic0iqozmk/location/LZ3BS3Y7KEAKD/services/3CIYMNCBEMMPYIQDLU267PIZ"
+          API = "https://app.squareup.com/appointments/api/buyer/availability"
+          LOCATION_ID = "LZ3BS3Y7KEAKD"
+          SERVICE_ID = "OVJQUJSMSBROOCAAM44OAIOE"   # ヘアセット > 洋装
+          STAFF_TOKEN = "TMlZNABHoCnIPfIk"          # りり
+          STAFF_ID = "qnrg2pynk9mmo2"
+
+          JST = ZoneInfo("Asia/Tokyo")
+          STATE = pathlib.Path("state.json")
+          YOUBI = "月火水木金土日"
+
+
+          # ---------- 空き枠を調べる ----------
+          def fetch_slots(now):
+              start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+              end = (start + dt.timedelta(days=DAYS_AHEAD + 1)) - dt.timedelta(milliseconds=1)
+              body = {"search_availability_request": {"query": {"filter": {
+                  "start_at_range": {
+                      "start_at": start.isoformat(timespec="milliseconds"),
+                      "end_at": end.isoformat(timespec="milliseconds"),
+                  },
+                  "location_id": LOCATION_ID,
+                  "segment_filters": [{
+                      "service_variation_id": SERVICE_ID,
+                      "team_member_id_filter": {"any": [STAFF_TOKEN]},
+                  }],
+              }}}}
+              req = urllib.request.Request(API, data=json.dumps(body).encode(), headers={
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "Origin": "https://book.squareup.com",
+                  "Referer": "https://book.squareup.com/",
+                  "User-Agent": "Mozilla/5.0",
+              })
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  data = json.load(r)
+              slots = set()
+              for a in data.get("availability", []):
+                  if a.get("available") and a.get("staff_id") == STAFF_ID:
+                      slots.add(dt.datetime.fromtimestamp(a["start"], JST))
+              return sorted(t for t in slots if t > now)
+
+
+          def wanted(t):
+              if WEEKDAYS_ONLY and t.weekday() >= 5:
+                  return False
+              return EARLIEST <= (t.hour, t.minute) <= LATEST
+
+
+          def label(t):
+              return f"{t.month}/{t.day}({YOUBI[t.weekday()]}) {t:%H:%M}"
+
+
+          # ---------- 予約する ----------
+          def book(t, submit=True):
+              """画面を操作して予約する。結果を ("ok"|"held"|"fail", 説明) で返す。"""
+              from playwright.sync_api import sync_playwright
+
+              info = {k: os.getenv(k, "").strip() for k in ("BOOK_LAST", "BOOK_FIRST", "BOOK_PHONE", "BOOK_EMAIL")}
+              if not all(info.values()):
+                  return "fail", "予約用の Secrets(BOOK_LAST / BOOK_FIRST / BOOK_PHONE / BOOK_EMAIL)が足りへん"
+              phone = info["BOOK_PHONE"].replace("-", "").replace(" ", "")
+              if phone.startswith("+81"):
+                  phone = phone[3:]
+              phone = phone.lstrip("0")
+
+              sel_js = "() => [...document.querySelectorAll('[data-testid^=date-]')].map(e=>e.dataset.testid).filter(x=>x.endsWith('-selected'))"
+              want_sel = [f"date-{t.day}-selected"]
+
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(channel="chrome")
+                  pg = browser.new_page(locale="ja-JP", timezone_id="Asia/Tokyo", viewport={"width": 390, "height": 844})
+                  pg.set_default_timeout(20000)
+                  try:
+                      pg.goto(BOOK_URL, wait_until="load", timeout=60000)
+                      pg.locator("label", has_text="洋装").first.click()
+                      pg.wait_for_timeout(600)
+                      pg.locator("label", has_text="りり").first.click()
+                      pg.wait_for_timeout(800)
+                      pg.get_by_text("予約", exact=True).last.click()
+                      pg.get_by_test_id("time-slot").first.wait_for(timeout=30000)
+
+                      # 日付を選ぶ(見えてなければ「来週」へ進む)
+                      for _ in range(6):
+                          if pg.evaluate(sel_js) == want_sel:
+                              break
+                          day_btn = pg.get_by_test_id(f"date-{t.day}")
+                          if day_btn.count():
+                              day_btn.click(timeout=3000)
+                              pg.wait_for_timeout(2000)
+                              if pg.evaluate(sel_js) == want_sel:
+                                  break
+                          pg.get_by_test_id("next-week-button").click()
+                          pg.wait_for_timeout(2000)
+                      if pg.evaluate(sel_js) != want_sel:
+                          return "fail", "カレンダーで日付を選べへんかった"
+
+                      slot = pg.get_by_test_id("time-slot").filter(has_text=f"{t:%H:%M}")
+                      if not slot.count():
+                          return "fail", "画面に行ったら枠がもう無かった(先に取られたかも)"
+                      slot.first.click()
+                      pg.wait_for_url("**/checkout", timeout=30000)
+
+                      pg.locator("market-field[name=phone] input").first.fill(phone)
+                      pg.locator("market-field[name=lastName] input").first.fill(info["BOOK_LAST"])
+                      pg.locator("market-field[name=firstName] input").first.fill(info["BOOK_FIRST"])
+                      pg.locator("market-field[name=email] input").first.fill(info["BOOK_EMAIL"])
+                      pg.wait_for_timeout(800)
+
+                      if not submit:
+                          return "held", "入力まで成功(テストやから送信はしてへん。枠は10分で自動解除)"
+
+                      btn = pg.get_by_test_id("book-appointment-button-mobile")
+                      if not btn.is_visible():
+                          btn = pg.get_by_test_id("book-appointment-button-desktop")
+                      btn.click()
+                      pg.wait_for_timeout(8000)
+
+                      body = pg.inner_text("body")
+                      url = pg.url
+                      if "checkout" not in url or any(w in body for w in ("確定", "完了", "ありがとう", "予約済み")):
+                          return "ok", "予約できた"
+                      if any(w in body for w in ("コード", "認証", "確認番号")):
+                          return "fail", "確認コードの入力を求められて止まった。10分以内やったら予約ページから手動で続けてな"
+                      return "fail", "送信後に完了画面が出えへんかった。念のためSMSやメールを確認して"
+                  except Exception as e:
+                      return "fail", f"画面操作の途中でエラー: {type(e).__name__}"
+                  finally:
+                      browser.close()
+
+
+          # ---------- LINE ----------
+          def send_line(text):
+              token, uid = os.getenv("LINE_TOKEN"), os.getenv("LINE_USER_ID")
+              if not token or not uid:
+                  print("LINE の設定(LINE_TOKEN / LINE_USER_ID)がまだやから通知は送らへん")
+                  return
+              req = urllib.request.Request(
+                  "https://api.line.me/v2/bot/message/push",
+                  data=json.dumps({"to": uid, "messages": [{"type": "text", "text": text[:4900]}]}).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+              )
+              urllib.request.urlopen(req, timeout=20)
+              print("LINE 送信OK")
+
+
+          # ---------- メイン ----------
+          def main():
+              now = dt.datetime.now(JST)
+              state = json.loads(STATE.read_text()) if STATE.exists() else {}
+              state.setdefault("notified", [])
+              log = [f"## チェック結果 {now:%m/%d %H:%M}"]
+
+              if os.getenv("RESET_BOOKED") == "true" and state.get("booked"):
+                  log.append(f"予約済みの記録({state['booked']})を消して再開")
+                  state.pop("booked")
+
+              if os.getenv("TEST_LINE") == "true":
+                  send_line("✅ テスト通知：空き枠チェッカーとLINEがつながったで")
+
+              slots = fetch_slots(now)
+              hits = [t for t in slots if wanted(t)]
+              log.append(f"りりさんの空き枠(全時間帯): {len(slots)} 件 / 条件に合う枠: {len(hits)} 件")
+              log += [f"- {label(t)}" for t in hits]
+
+              # 予約テスト:一番先の枠で入力まで試す(送信はしない)
+              if os.getenv("TEST_BOOKING") == "true" and slots:
+                  t = slots[-1]
+                  result, msg = book(t, submit=False)
+                  log.append(f"予約テスト {label(t)}: {msg}")
+                  send_line(f"🧪 予約テスト({label(t)}):{msg}")
+
+              if state.get("booked"):
+                  log.append(f"予約済み({state['booked']})なので今回は何もせえへん")
+              else:
+                  done = set(state["notified"])
+                  new = [t for t in hits if t.isoformat() not in done]
+                  for t in new:
+                      done.add(t.isoformat())
+                      if AUTO_BOOK:
+                          result, msg = book(t)
+                          log.append(f"{label(t)} の予約: {msg}")
+                          if result == "ok":
+                              state["booked"] = label(t)
+                              send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n"
+                                        f"行かれへん時は早めにキャンセルしてな。\n次を取りたい時は GitHub で『予約済みを解除』して実行してな。")
+                              break
+                          send_line(f"⚠️ りりさんに空き({label(t)})が出たけど自動予約できへんかった。\n理由:{msg}\n\n急いで手動で👇\n{BOOK_URL}")
+                      else:
+                          send_line(f"🔔 りりさんに空きが出たで！\nALiS永楽 ヘアセット(洋装)\n・{label(t)}\n\n早めに予約してな👇\n{BOOK_URL}")
+                  state["notified"] = sorted(done & {t.isoformat() for t in hits})
+
+              STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1))
+              text = "\n".join(log)
+              print(text)
+              if os.getenv("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                      f.write(text + "\n")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 check.py
+
+      - name: 記録を保存
+        if: always()
+        run: |
+          git config user.name "checker-bot"
+          git config user.email "checker-bot@users.noreply.github.com"
+          git add state.json || true
+          git commit -m "記録を更新" || true
+          git push || true
