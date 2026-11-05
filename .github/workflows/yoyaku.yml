@@ -179,7 +179,7 @@ jobs:
               if not slot.count():
                   return "fail", "画面に行ったら枠がもう無かった(先に取られたかも)"
               slot.first.click()
-              pg.wait_for_url("**/checkout", timeout=30000)
+              pg.wait_for_url("**/checkout", timeout=15000)
               pg.locator("market-field[name=phone] input").first.fill(info["BOOK_PHONE"])
               pg.locator("market-field[name=lastName] input").first.fill(info["BOOK_LAST"])
               pg.locator("market-field[name=firstName] input").first.fill(info["BOOK_FIRST"])
@@ -258,12 +258,15 @@ jobs:
                           wait = (open_at - dt.timedelta(seconds=60) - dt.datetime.now(JST)).total_seconds()
                           if wait > 0:
                               time.sleep(wait)
-                          prepare(pg)
-                          ready = True
+                          ready = False
                           while dt.datetime.now(JST) < give_up:
                               if not ready:
-                                  prepare(pg)
-                                  ready = True
+                                  try:
+                                      prepare(pg)
+                                      ready = True
+                                  except Exception:
+                                      time.sleep(1)
+                                      continue
                               try:
                                   found = t in fetch_slots(dt.datetime.now(JST))
                               except Exception:
@@ -272,11 +275,20 @@ jobs:
                                   time.sleep(1)
                                   continue
                               ready = False
-                              if not go_calendar(pg, day):
-                                  log.append("張り付きモード:カレンダーで日付を選べへんかった")
+                              stamp = dt.datetime.now(JST).strftime("%H:%M:%S")
+                              try:
+                                  if not go_calendar(pg, day):
+                                      log.append(f"張り付きモード {stamp}:カレンダーで日付を選べへんかった")
+                                      continue
+                              except Exception as e:
+                                  log.append(f"張り付きモード {stamp}:カレンダー表示でエラー {type(e).__name__}(もう一回いく)")
                                   continue
-                              result, msg = checkout(pg, t, info)
-                              log.append(f"張り付きモード {label(t)}: {msg}")
+                              try:
+                                  result, msg = checkout(pg, t, info)
+                              except Exception as e:
+                                  log.append(f"張り付きモード {stamp}:予約画面でエラー {type(e).__name__}(先に押さえられたかも。もう一回いく)")
+                                  continue
+                              log.append(f"張り付きモード {stamp} {label(t)}: {msg}")
                               if result == "ok":
                                   booked[day.isoformat()] = label(t)
                                   send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n行かれへん時は早めにキャンセルしてな。")
