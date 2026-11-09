@@ -3,8 +3,13 @@ name: 空き枠チェック
 on:
   schedule:
     - cron: "*/5 * * * *"   # 5分おき(GitHubの都合で数分〜十数分遅れることがある)
-    - cron: "20 9 * * 1-5"  # 平日18:20(日本時間) 張り付きモード開始
-    - cron: "50 9 * * 1-5"  # 平日18:50(日本時間) 張り付きモードの予備
+    # 平日の夕方は張り付きモード。GitHubは予定通りに動かへんことが多いから、何回も起こしとく
+    - cron: "47 8 * * 1-5"  # 17:47(日本時間)
+    - cron: "7 9 * * 1-5"   # 18:07
+    - cron: "27 9 * * 1-5"  # 18:27
+    - cron: "47 9 * * 1-5"  # 18:47
+    - cron: "7 10 * * 1-5"  # 19:07
+    - cron: "17 10 * * 1-5" # 19:17
   workflow_dispatch:
     inputs:
       test_line:
@@ -30,7 +35,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -215,12 +220,16 @@ jobs:
                   return "fail", "予約用の Secrets(BOOK_LAST / BOOK_FIRST / BOOK_PHONE / BOOK_EMAIL)が足りへん"
               with sync_playwright() as p:
                   browser, pg = new_page(p)
+                  step = "ページを開く"
                   try:
-                      if not open_calendar(pg, t.date()):
+                      prepare(pg)
+                      step = "カレンダー表示"
+                      if not go_calendar(pg, t.date()):
                           return "fail", "カレンダーで日付を選べへんかった"
+                      step = "時間を押して入力・送信"
                       return checkout(pg, t, info, submit)
                   except Exception as e:
-                      return "fail", f"画面操作の途中でエラー: {type(e).__name__}"
+                      return "fail", f"「{step}」でエラー {type(e).__name__}"
                   finally:
                       browser.close()
 
@@ -236,7 +245,7 @@ jobs:
               h, m = EARLIEST
               while (h, m) <= LATEST:
                   t = dt.datetime(day.year, day.month, day.day, h, m, tzinfo=JST)
-                  if wanted(t) and t - dt.timedelta(days=DAYS_AHEAD) + dt.timedelta(minutes=10) > now:
+                  if wanted(t) and t - dt.timedelta(days=DAYS_AHEAD) + dt.timedelta(minutes=20) > now:
                       targets.append(t)
                   m += 15
                   h, m = h + m // 60, m % 60
@@ -253,7 +262,7 @@ jobs:
                   try:
                       for t in targets:
                           open_at = t - dt.timedelta(days=DAYS_AHEAD)      # この時刻に枠が開く
-                          give_up = open_at + dt.timedelta(minutes=10)
+                          give_up = open_at + dt.timedelta(minutes=20)
                           # 開く1分前まで待って、メニューとりりさんを選んだ状態で待ち構える
                           wait = (open_at - dt.timedelta(seconds=60) - dt.datetime.now(JST)).total_seconds()
                           if wait > 0:
@@ -353,8 +362,8 @@ jobs:
                   log.append(f"予約テスト {label(t)}: {msg}")
                   send_line(f"🧪 予約テスト({label(t)}):{msg}")
 
-              # 張り付きモード:平日の 18:20〜19:46 の間に動いた時だけ
-              if AUTO_BOOK and (dt.time(18, 20) <= now.time() <= dt.time(LATEST[0], LATEST[1] + 1)):
+              # 張り付きモード:17:40〜20:45 の間に動いた時だけ
+              if AUTO_BOOK and (dt.time(17, 40) <= now.time() <= dt.time(LATEST[0] + 1, LATEST[1] % 60)):
                   snipe(now, booked, log)
                   now = dt.datetime.now(JST)
                   slots = fetch_slots(now)
@@ -363,9 +372,8 @@ jobs:
               done = set(state["notified"])
               for t in hits:
                   day = t.date().isoformat()
-                  if day in booked or t.isoformat() in done:
+                  if day in booked or (not AUTO_BOOK and t.isoformat() in done):
                       continue
-                  done.add(t.isoformat())
                   if AUTO_BOOK:
                       result, msg = book(t)
                       log.append(f"{label(t)} の予約: {msg}")
@@ -373,30 +381,21 @@ jobs:
                           booked[day] = label(t)
                           send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n行かれへん時は早めにキャンセルしてな。")
                       else:
-                          send_line(f"⚠️ りりさんに空き({label(t)})が出たけど自動予約できへんかった。\n理由:{msg}\n\n急いで手動で👇\n{BOOK_URL}")
+                          if t.isoformat() not in done:
+                              send_line(f"⚠️ りりさんに空き({label(t)})が出たけど自動予約できへんかった。\n理由:{msg}\n\n急いで手動で👇\n{BOOK_URL}")
+                          done.add(t.isoformat())
                   else:
+                      done.add(t.isoformat())
                       send_line(f"🔔 りりさんに空きが出たで！\nALiS永楽 ヘアセット(洋装)\n・{label(t)}\n\n早めに予約してな👇\n{BOOK_URL}")
               state["notified"] = sorted(done & {t.isoformat() for t in hits})
               state.pop("booked", None)
 
               STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1))
               text = "\n".join(log)
+              if len(log) > 2 or os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+                  lf = pathlib.Path("log.md")
+                  old_lines = lf.read_text(encoding="utf-8").splitlines() if lf.exists() else []
+                  lf.write_text("\n".join((old_lines + [""] + log)[-400:]) + "\n", encoding="utf-8")
               print(text)
               if os.getenv("GITHUB_STEP_SUMMARY"):
-                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-                      f.write(text + "\n")
-
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-          python3 check.py
-
-      - name: 記録を保存
-        if: always()
-        run: |
-          git config user.name "checker-bot"
-          git config user.email "checker-bot@users.noreply.github.com"
-          git add state.json || true
-          git commit -m "記録を更新" || true
-          git push || true
+                  with open(os.environ["GITHU
