@@ -148,13 +148,17 @@ def checkout(pg, t, info, submit=True):
     if not btn.is_visible():
         btn = pg.get_by_test_id("book-appointment-button-desktop")
     btn.click()
-    pg.wait_for_timeout(8000)
-    body = pg.inner_text("body")
-    if "checkout" not in pg.url or any(w in body for w in ("確定", "完了", "ありがとう", "予約済み")):
-        return "ok", "予約できた"
-    if any(w in body for w in ("コード", "認証", "確認番号")):
-        return "fail", "確認コードの入力を求められて止まった。10分以内やったら予約ページから手動で続けてな"
-    return "fail", "送信後に完了画面が出えへんかった。念のためメールを確認して"
+    # 完了画面に切り替わるのを最大25秒待つ
+    for _ in range(50):
+        pg.wait_for_timeout(500)
+        body = pg.inner_text("body")
+        if any(w in body for w in ("コード", "認証", "確認番号")):
+            return "fail", "確認コードの入力を求められて止まった。10分以内やったら予約ページから手動で続けてな"
+        if "checkout" not in pg.url or any(w in body for w in ("確定", "完了", "ありがとう", "予約済み")):
+            return "ok", f"予約できた(画面:{pg.url.rsplit('/', 1)[-1].split('?')[0]})"
+    # 入力画面のまま → 何かエラーが出てる(個人情報は残さへんように、エラーっぽい行だけ拾う)
+    errs = [l for l in body.splitlines() if any(w in l for w in ("エラー", "無効", "できません", "入力してください", "利用できません"))]
+    return "fail", "送信しても完了画面にならへんかった。念のためメールを確認して" + (f"(画面の表示:{' / '.join(errs)[:120]})" if errs else "")
 
 
 def new_page(p):
@@ -238,6 +242,7 @@ def snipe(now, booked, log, submit=True, day=None, targets=None, open_shift=None
             return ctx, pg
 
         ctx, pg = fresh()
+        tries = {}
         try:
             while dt.datetime.now(JST) < last_give_up:
                 n = dt.datetime.now(JST)
@@ -251,7 +256,8 @@ def snipe(now, booked, log, submit=True, day=None, targets=None, open_shift=None
                 if not pending:
                     time.sleep(1)
                     continue
-                t = pending[0]
+                t = min(pending, key=lambda x: tries.get(x, 0))
+                tries[t] = tries.get(t, 0) + 1
                 stamp = n.strftime("%H:%M:%S")
                 step = "カレンダー表示"
                 try:
