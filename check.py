@@ -126,8 +126,17 @@ def checkout(pg, t, info, submit=True):
     slot = pg.get_by_test_id("time-slot").filter(has_text=f"{t:%H:%M}")
     if not slot.count():
         return "fail", "画面に行ったら枠がもう無かった(先に取られたかも)"
-    slot.first.click()
-    pg.wait_for_url("**/checkout", timeout=15000)
+    el = slot.first
+    try:
+        el.scroll_into_view_if_needed(timeout=3000)
+        el.click(timeout=6000)
+    except Exception:
+        el.evaluate("e => e.click()")          # 何かに隠れて押せへん時は直接押す
+    try:
+        pg.wait_for_url("**/checkout", timeout=15000)
+    except Exception:
+        text = " ".join(pg.inner_text("body").split())[:150]
+        raise RuntimeError(f"時間を押しても入力画面に進まへん(画面:{pg.url.rsplit('/', 1)[-1]} / {text})")
     pg.locator("market-field[name=phone] input").first.fill(info["BOOK_PHONE"])
     pg.locator("market-field[name=lastName] input").first.fill(info["BOOK_LAST"])
     pg.locator("market-field[name=firstName] input").first.fill(info["BOOK_FIRST"])
@@ -172,26 +181,31 @@ def book(t, submit=True):
             step = "時間を押して入力・送信"
             return checkout(pg, t, info, submit)
         except Exception as e:
-            return "fail", f"「{step}」でエラー {type(e).__name__}"
+            detail = str(e).splitlines()[0][:200] if isinstance(e, RuntimeError) else type(e).__name__
+            return "fail", f"「{step}」でエラー {detail}"
         finally:
             browser.close()
 
 
-def snipe(now, booked, log):
+def snipe(now, booked, log, submit=True, day=None, targets=None, open_shift=None):
     """張り付きモード:2週間後の同じ日の19:30/19:45 は、今日の19:30/19:45 ぴったりに開く。
-    開く少し前から画面を開いて待ち構えて、出た瞬間に予約する。"""
+    19:30 と 19:45 を同時に見張って、開いた瞬間に予約しにいく。
+    1回失敗したら、画面を全部閉じて新しく開き直してから、もう一回いく。"""
     import time
     from playwright.sync_api import sync_playwright
 
-    day = now.date() + dt.timedelta(days=DAYS_AHEAD)
-    targets = []
-    h, m = EARLIEST
-    while (h, m) <= LATEST:
-        t = dt.datetime(day.year, day.month, day.day, h, m, tzinfo=JST)
-        if wanted(t) and t - dt.timedelta(days=DAYS_AHEAD) + dt.timedelta(minutes=20) > now:
-            targets.append(t)
-        m += 15
-        h, m = h + m // 60, m % 60
+    shift = open_shift if open_shift is not None else dt.timedelta(days=DAYS_AHEAD)
+    if day is None:
+        day = now.date() + dt.timedelta(days=DAYS_AHEAD)
+    if targets is None:
+        targets = []
+        h, m = EARLIEST
+        while (h, m) <= LATEST:
+            t = dt.datetime(day.year, day.month, day.day, h, m, tzinfo=JST)
+            if wanted(t) and t - shift + dt.timedelta(minutes=20) > now:
+                targets.append(t)
+            m += 15
+            h, m = h + m // 60, m % 60
     if not targets or day.isoformat() in booked:
         return
     info = booking_info()
@@ -200,55 +214,73 @@ def snipe(now, booked, log):
         return
 
     log.append("張り付きモード:" + "、".join(label(t) for t in targets) + " を狙う")
+    first_open = min(t - shift for t in targets)
+    last_give_up = max(t - shift for t in targets) + dt.timedelta(minutes=20)
+
+    # 最初の枠が開く1分前まで待つ
+    wait = (first_open - dt.timedelta(seconds=60) - dt.datetime.now(JST)).total_seconds()
+    if wait > 0:
+        time.sleep(wait)
+
     with sync_playwright() as p:
-        browser, pg = new_page(p)
+        browser = p.chromium.launch(channel="chrome")
+
+        def fresh():
+            """まっさらな画面を開いて、メニューとりりさんを選んだ状態で待機させる。"""
+            ctx = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo",
+                                      viewport={"width": 390, "height": 844})
+            pg = ctx.new_page()
+            pg.set_default_timeout(15000)
+            try:
+                prepare(pg)
+            except Exception:
+                pass
+            return ctx, pg
+
+        ctx, pg = fresh()
         try:
-            for t in targets:
-                open_at = t - dt.timedelta(days=DAYS_AHEAD)      # この時刻に枠が開く
-                give_up = open_at + dt.timedelta(minutes=20)
-                # 開く1分前まで待って、メニューとりりさんを選んだ状態で待ち構える
-                wait = (open_at - dt.timedelta(seconds=60) - dt.datetime.now(JST)).total_seconds()
-                if wait > 0:
-                    time.sleep(wait)
-                ready = False
-                while dt.datetime.now(JST) < give_up:
-                    if not ready:
-                        try:
-                            prepare(pg)
-                            ready = True
-                        except Exception:
-                            time.sleep(1)
-                            continue
-                    try:
-                        found = t in fetch_slots(dt.datetime.now(JST))
-                    except Exception:
-                        found = False
-                    if not found:
-                        time.sleep(1)
-                        continue
-                    ready = False
-                    stamp = dt.datetime.now(JST).strftime("%H:%M:%S")
-                    try:
-                        if not go_calendar(pg, day):
-                            log.append(f"張り付きモード {stamp}:カレンダーで日付を選べへんかった")
-                            continue
-                    except Exception as e:
-                        log.append(f"張り付きモード {stamp}:カレンダー表示でエラー {type(e).__name__}(もう一回いく)")
-                        continue
-                    try:
-                        result, msg = checkout(pg, t, info)
-                    except Exception as e:
-                        log.append(f"張り付きモード {stamp}:予約画面でエラー {type(e).__name__}(先に押さえられたかも。もう一回いく)")
-                        continue
-                    log.append(f"張り付きモード {stamp} {label(t)}: {msg}")
+            while dt.datetime.now(JST) < last_give_up:
+                n = dt.datetime.now(JST)
+                try:
+                    open_now = set(fetch_slots(n))
+                except Exception:
+                    time.sleep(1)
+                    continue
+                pending = [t for t in targets
+                           if t - shift <= n < t - shift + dt.timedelta(minutes=20) and t in open_now]
+                if not pending:
+                    time.sleep(1)
+                    continue
+                t = pending[0]
+                stamp = n.strftime("%H:%M:%S")
+                step = "カレンダー表示"
+                try:
+                    if not pg.url.endswith("/services/3CIYMNCBEMMPYIQDLU267PIZ"):
+                        prepare(pg)
+                    if not go_calendar(pg, day):
+                        raise RuntimeError("カレンダーで日付を選べへんかった")
+                    step = "時間を押して入力・送信"
+                    result, msg = checkout(pg, t, info, submit)
+                except Exception as e:
+                    detail = str(e).splitlines()[0][:200] if isinstance(e, RuntimeError) else type(e).__name__
+                    result, msg = "fail", f"「{step}」でエラー {detail}"
+                log.append(f"張り付きモード {stamp} {label(t)}: {msg}")
+                if result in ("ok", "held"):
                     if result == "ok":
                         booked[day.isoformat()] = label(t)
                         send_line(f"🎉 予約取れたで！\nALiS永楽 ヘアセット(洋装) りりさん\n📅 {label(t)}\n\n行かれへん時は早めにキャンセルしてな。")
-                        return
-                log.append(f"張り付きモード {label(t)}: 取れへんかった")
+                    return
+                # 失敗したら画面を閉じて、まっさらな状態から開き直す
+                ctx.close()
+                ctx, pg = fresh()
+            log.append("張り付きモード:時間切れで取れへんかった")
         except Exception as e:
             log.append(f"張り付きモード:エラー {type(e).__name__}")
         finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
             browser.close()
 
 
@@ -299,8 +331,10 @@ def main():
         log.append("予約済みの日: " + "、".join(booked[d] for d in sorted(booked)))
 
     # 予約テスト:一番先の枠で入力まで試す(送信はしない)
-    if os.getenv("TEST_BOOKING") == "true" and slots:
-        t = slots[-1]
+    # 狙ってる時間帯の枠では絶対にテストせえへん(テストで仮押さえしてまうから)
+    test_slots = [t for t in slots if not wanted(t)]
+    if os.getenv("TEST_BOOKING") == "true" and test_slots:
+        t = test_slots[-1]
         result, msg = book(t, submit=False)
         log.append(f"予約テスト {label(t)}: {msg}")
         send_line(f"🧪 予約テスト({label(t)}):{msg}")
