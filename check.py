@@ -141,24 +141,58 @@ def checkout(pg, t, info, submit=True):
     pg.locator("market-field[name=lastName] input").first.fill(info["BOOK_LAST"])
     pg.locator("market-field[name=firstName] input").first.fill(info["BOOK_FIRST"])
     pg.locator("market-field[name=email] input").first.fill(info["BOOK_EMAIL"])
-    pg.wait_for_timeout(500)
-    if not submit:
-        return "held", "入力まで成功(テストやから送信はしてへん。枠は10分で自動解除)"
+    pg.wait_for_timeout(800)
+    # 「以前、Square 予約で予約されたことがあるようです」のポップアップが出たら「ゲストとして続行する」を押す
+    guest_ok = dismiss_login_popup(pg)
     btn = pg.get_by_test_id("book-appointment-button-mobile")
     if not btn.is_visible():
         btn = pg.get_by_test_id("book-appointment-button-desktop")
-    btn.click()
+    # 押せる状態か確認(ここで押されへんなら、何かが邪魔してる)
+    clickable = False
+    for _ in range(3):
+        try:
+            btn.click(trial=True, timeout=3000)
+            clickable = True
+            break
+        except Exception:
+            guest_ok = dismiss_login_popup(pg) or guest_ok
+    if not submit:
+        note = "ポップアップをゲストで閉じた。" if guest_ok else ""
+        state = "「予約する」も押せる状態" if clickable else "「予約する」が押されへん状態"
+        return "held", f"入力まで成功、{note}{state}(テストやから送信はしてへん。枠は10分で自動解除)"
+    if not clickable:
+        return "fail", "「予約する」ボタンが押されへんかった(何かのポップアップが邪魔してるかも)"
+    btn.click(timeout=5000)
     # 完了画面に切り替わるのを最大25秒待つ
     for _ in range(50):
         pg.wait_for_timeout(500)
+        if dismiss_login_popup(pg):          # 送信後に出た時も、ゲストで続ける
+            try:
+                btn.click(timeout=5000)
+            except Exception:
+                pass
+            continue
         body = pg.inner_text("body")
-        if any(w in body for w in ("コード", "認証", "確認番号")):
+        if any(w in body for w in ("確認コードを入力", "認証コード", "確認番号")):
             return "fail", "確認コードの入力を求められて止まった。10分以内やったら予約ページから手動で続けてな"
         if "checkout" not in pg.url or any(w in body for w in ("確定", "完了", "ありがとう", "予約済み")):
             return "ok", f"予約できた(画面:{pg.url.rsplit('/', 1)[-1].split('?')[0]})"
     # 入力画面のまま → 何かエラーが出てる(個人情報は残さへんように、エラーっぽい行だけ拾う)
     errs = [l for l in body.splitlines() if any(w in l for w in ("エラー", "無効", "できません", "入力してください", "利用できません"))]
     return "fail", "送信しても完了画面にならへんかった。念のためメールを確認して" + (f"(画面の表示:{' / '.join(errs)[:120]})" if errs else "")
+
+
+def dismiss_login_popup(pg):
+    """ログインを勧めるポップアップが出てたら「ゲストとして続行する」を押す。押したら True。"""
+    try:
+        g = pg.locator("market-dialog").get_by_text("ゲストとして続行する")
+        if g.count() and g.first.is_visible():
+            g.first.click(timeout=3000)
+            pg.wait_for_timeout(800)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def new_page(p):
