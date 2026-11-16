@@ -70,6 +70,23 @@ def label(t):
     return f"{t.month}/{t.day}({YOUBI[t.weekday()]}) {t:%H:%M}"
 
 
+# ---------- 最新の予約記録を取り直す ----------
+def refresh_booked(booked):
+    """GitHub 上の最新の state.json を読み直して、ほかの実行が取った予約を booked に足す。
+    (古い記録のまま動き出した実行が、同じ日にもう1枠取ってしまうのを防ぐ)"""
+    import subprocess
+    try:
+        subprocess.run(["git", "fetch", "-q", "origin", "main"], timeout=20, check=True)
+        out = subprocess.run(["git", "show", "origin/main:state.json"], timeout=10,
+                             check=True, capture_output=True, text=True).stdout
+        latest = json.loads(out).get("booked_days", {})
+        added = {k: v for k, v in latest.items() if k not in booked}
+        booked.update(latest)
+        return added
+    except Exception:
+        return {}
+
+
 # ---------- 予約する ----------
 SEL_JS = "() => [...document.querySelectorAll('[data-testid^=date-]')].map(e=>e.dataset.testid).filter(x=>x.endsWith('-selected'))"
 TIMES_JS = "() => [...document.querySelectorAll('[data-testid=time-slot]')].map(e=>e.innerText.trim())"
@@ -97,16 +114,26 @@ def prepare(pg):
 def go_calendar(pg, day):
     """「予約」を押してカレンダーを出し、day(日付)を選ぶ。押した時点の最新の空き枠が読み込まれる。"""
     pg.get_by_text("予約", exact=True).last.click()
-    pg.get_by_test_id("time-slot").first.wait_for(timeout=30000)
+    # カレンダー(週の切り替えボタン)が出るまで待つ。今日の枠が無い日は時間の一覧が出えへんから、それは待たへん
+    pg.get_by_test_id("next-week-button").wait_for(timeout=30000)
+    pg.wait_for_timeout(500)
     want = [f"date-{day.day}-selected"]
     for _ in range(8):
         if pg.evaluate(SEL_JS) == want:
+            try:
+                pg.get_by_test_id("time-slot").first.wait_for(timeout=5000)
+            except Exception:
+                pass
             return True
         btn = pg.get_by_test_id(f"date-{day.day}")
         if btn.count():
             btn.click(timeout=3000)
             try:
                 pg.wait_for_function(f"() => !!document.querySelector('[data-testid=\"date-{day.day}-selected\"]')", timeout=2500)
+                try:
+                    pg.get_by_test_id("time-slot").first.wait_for(timeout=5000)
+                except Exception:
+                    pass
                 pg.wait_for_timeout(300)
                 return True
             except Exception:
@@ -259,6 +286,10 @@ def snipe(now, booked, log, submit=True, day=None, targets=None, open_shift=None
     wait = (first_open - dt.timedelta(seconds=60) - dt.datetime.now(JST)).total_seconds()
     if wait > 0:
         time.sleep(wait)
+    refresh_booked(booked)
+    if day.isoformat() in booked:
+        log.append(f"張り付きモード:{booked[day.isoformat()]} がもう予約済みやから中止")
+        return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="chrome")
@@ -288,6 +319,11 @@ def snipe(now, booked, log, submit=True, day=None, targets=None, open_shift=None
                 pending = [t for t in targets
                            if t - shift <= n < t - shift + dt.timedelta(minutes=20) and t in open_now]
                 if not pending:
+                    if n.second % 30 == 0:
+                        refresh_booked(booked)
+                        if day.isoformat() in booked:
+                            log.append(f"張り付きモード:{booked[day.isoformat()]} がもう予約済みやから中止")
+                            return
                     time.sleep(1)
                     continue
                 t = min(pending, key=lambda x: tries.get(x, 0))
@@ -356,6 +392,21 @@ def main():
             if unbook.lower() == "all" or unbook in (f"{d.month}/{d.day}", f"{d.month:02d}/{d.day:02d}"):
                 log.append(f"{booked.pop(day)} の予約済み記録を消した(その日もまた狙う)")
 
+    # 「自分で予約した日」(例: 11/30 、何日かあるなら 11/30,12/2)→ その日はボットが取らへん
+    for part in (os.getenv("BOOKED_DAY") or "").replace("、", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            m, d = (int(x) for x in part.split("/"))
+            day = dt.date(now.year, m, d)
+            if day < now.date():
+                day = dt.date(now.year + 1, m, d)
+            booked[day.isoformat()] = f"{m}/{d}(自分で予約)"
+            log.append(f"{m}/{d} を「自分で予約した日」にした(この日はボットは取らへん)")
+        except Exception:
+            log.append(f"「{part}」は日付として読まれへんかった(11/30 みたいに入れてな)")
+
     # 過ぎた日の記録は消す
     for day in [d for d in booked if d < today]:
         booked.pop(day)
@@ -386,6 +437,10 @@ def main():
         slots = fetch_slots(now)
         hits = [t for t in slots if wanted(t)]
 
+    if hits:
+        added = refresh_booked(booked)
+        if added:
+            log.append("最新の記録で予約済みになってた日: " + "、".join(added.values()))
     done = set(state["notified"])
     for t in hits:
         day = t.date().isoformat()
@@ -403,21 +458,4 @@ def main():
                 done.add(t.isoformat())
         else:
             done.add(t.isoformat())
-            send_line(f"🔔 りりさんに空きが出たで！\nALiS永楽 ヘアセット(洋装)\n・{label(t)}\n\n早めに予約してな👇\n{BOOK_URL}")
-    state["notified"] = sorted(done & {t.isoformat() for t in hits})
-    state.pop("booked", None)
-
-    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1))
-    text = "\n".join(log)
-    if len(log) > 2 or os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        lf = pathlib.Path("log.md")
-        old_lines = lf.read_text(encoding="utf-8").splitlines() if lf.exists() else []
-        lf.write_text("\n".join((old_lines + [""] + log)[-400:]) + "\n", encoding="utf-8")
-    print(text)
-    if os.getenv("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-            f.write(text + "\n")
-
-
-if __name__ == "__main__":
-    main()
+            send_line(f"🔔 りりさんに空きが出たで！
